@@ -8,8 +8,8 @@ use axum::{
 	Router
 };
 use once_cell::sync::OnceCell;
-use tokio::fs::File;
-use tokio_util::io::ReaderStream;
+use tokio::{fs::File, io::AsyncReadExt};
+use tokio_util::{bytes::buf, io::ReaderStream};
 
 #[derive(sqlx::FromRow, Debug, PartialEq, Eq)]
 struct FileInfo {
@@ -44,10 +44,12 @@ async fn main() -> anyhow::Result<()> {
 	Ok(())
 }
 
+//MySqlPoolを拾ってくる
 fn get_sql_pool() -> &'static MySqlPool {
 	SQL_POOL.get().expect("SQL_POOLが初期化されてない")
 }
 
+//ファイル名→ID
 async fn get_file_id(bucket: &str, file_name: &str) -> Option<String> {
 	let pool = get_sql_pool();
 
@@ -68,28 +70,80 @@ async fn get_file_id(bucket: &str, file_name: &str) -> Option<String> {
 	None
 }
 
+//マジックナンバーからMIMEタイプを引っ張ってくるのです
+async fn get_mimetype(file_path: &str) -> &'static str {
+	let mut file = match File::open(file_path).await {
+		Ok(f) => f,
+		Err(_) => return "application/octet-stream"
+	};
+
+	let mut buffer = [0u8; 12];
+	let bytes_read = match file.read(&mut buffer).await {
+		Ok(n) => n,
+		Err(_) => return "application/octet-stream"
+	};
+
+	let slice = &buffer[..bytes_read];
+
+	if slice.len() >= 8 && &slice[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+		//PNG
+		return "image/png";
+	} else if slice.len() >= 3 && &slice[0..3] == &[0xFF, 0xD8, 0xFF] {
+		//JPG
+		return "image/jpeg";
+	} else if slice.len() >= 12 && &slice[0..4] == b"RIFF" && &slice[8..12] == b"WEBP" {
+		//WebP
+		return "image/webp";
+	} else if slice.len() >= 6 && (&slice[0..6] == b"GIF87a" || &slice[0..6] == b"GIF89a") {
+		//GIF
+		"image/gif"
+	} else if slice.len() >= 5 && &slice[0..5] == b"%PDF-" {
+		//PDF
+		"application/pdf"
+	} else if slice.len() >= 12 && &slice[4..8] == b"ftyp" {
+		//MP4
+		"video/mp4"
+	} else if slice.len() >= 4 && &slice[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+		//簡易判定です。
+		//中に「webm」があればWebM、なければMKV
+		if slice.windows(4).any(|w| w == b"webm") {
+			"video/webm"
+		} else {
+			"video/x-matroska"
+		}
+	} else {
+		"application/octet-stream"
+	}
+}
+
+//HTTPリクエストでアクセスするばしょ
 async fn root(Path(FilePath{bucket, name}): Path<FilePath>) -> Response {
 	let query = get_file_id(&bucket, &name).await;
 
 	if let Some(file_id) = query {
+		println!("[  \x1b[32mOK  \x1b[0m]BUCKET:{bucket} NAME:{name} -> {file_id}");
+
 		let file_path = format!("/home/rumisan/Documents/RDS/{file_id}");
 		match File::open(&file_path).await {
 			Ok(file) => {
+				//メモリ破壊マン回避
 				let stream = ReaderStream::new(file);
 				let body = Body::from_stream(stream);
 				let header_list = [
-					(header::CONTENT_TYPE, "application/octet-stream")
+					(header::CONTENT_TYPE, get_mimetype(&file_path).await)
 				];
 
 				(StatusCode::OK, header_list, body).into_response()
 			},
 			Err(_) => {
+				//ファイルを開けなかった
 				let mut header_list = HeaderMap::new();
 				header_list.insert(header::CONTENT_TYPE, "text/plain; charset=UTF-8".parse().unwrap());
 				(StatusCode::NOT_FOUND, header_list, format!("ファイル本体が見つかりませんでした（泣）\nバケット名:{bucket}\nファイル名:{name}")).into_response()
 			}
 		}
 	} else {
+		//そんなファイルねーよばーーーーーーーーーか
 		let mut header_list = HeaderMap::new();
 		header_list.insert(header::CONTENT_TYPE, "text/plain; charset=UTF-8".parse().unwrap());
 		(StatusCode::NOT_FOUND, header_list, format!("ファイルが見つかりませんでした（泣）\nバケット名:{bucket}\nファイル名:{name}")).into_response()
