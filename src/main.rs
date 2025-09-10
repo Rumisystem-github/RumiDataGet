@@ -9,7 +9,9 @@ use axum::{
 };
 use once_cell::sync::OnceCell;
 use tokio::{fs::File, io::AsyncReadExt};
-use tokio_util::{bytes::buf, io::ReaderStream};
+use tokio_util::io::ReaderStream;
+use lru::LruCache;
+use std::{num::NonZeroUsize, sync::{LazyLock, Mutex}};
 
 #[derive(sqlx::FromRow, Debug, PartialEq, Eq)]
 struct FileInfo {
@@ -23,6 +25,9 @@ struct FilePath {
 }
 
 static SQL_POOL: OnceCell<MySqlPool> = OnceCell::new();
+static LRU_CACHE: LazyLock<Mutex<LruCache<String, String>>> = LazyLock::new(|| {
+	Mutex::new(LruCache::new(NonZeroUsize::new(100).unwrap()))
+});
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -51,18 +56,29 @@ fn get_sql_pool() -> &'static MySqlPool {
 
 //ファイル名→ID
 async fn get_file_id(bucket: &str, file_name: &str) -> Option<String> {
-	let pool = get_sql_pool();
+	if let Some(file_id_str) = LRU_CACHE.lock().unwrap().get(&format!("{bucket}+{file_name}")) {
+		println!("[  \x1b[32mOK  \x1b[0m]BUCKET:{bucket} NAME:{file_name} -[CACHE]-> {file_id_str}");
+		return Some(file_id_str.to_string());
+	} else {
+		let pool = get_sql_pool();
+		let script = "SELECT `FILE` FROM `DATA` WHERE `NAME` = ? AND `BUCKET` = ? AND `PUBLIC` = 1;";
+		let query_result:anyhow::Result<Vec<FileInfo>, sqlx::Error> = sqlx::query_as(script)
+			.bind(file_name)
+			.bind(bucket)
+			.fetch_all(pool).await;
 
-	let script = "SELECT `FILE` FROM `DATA` WHERE `NAME` = ? AND `BUCKET` = ? AND `PUBLIC` = 1;";
-	let query_result:anyhow::Result<Vec<FileInfo>, sqlx::Error> = sqlx::query_as(script)
-		.bind(file_name)
-		.bind(bucket)
-		.fetch_all(pool).await;
+		if let Ok(query) = query_result {
+			if let Some(row) = query.first() {
+				if let Some(file_id) = row.FILE.as_ref() {
+					let file_id_str = file_id.to_string();
 
-	if let Ok(query) = query_result {
-		if let Some(row) = query.first() {
-			if let Some(file_id) = row.FILE.as_ref() {
-				return Some(file_id.to_string());
+					let mut cache = LRU_CACHE.lock().unwrap();
+					cache.put(format!("{bucket}+{file_name}"), file_id_str.clone());
+
+					println!("[  \x1b[32mOK  \x1b[0m]BUCKET:{bucket} NAME:{file_name} -[ SQL ]-> {file_id}");
+
+					return Some(file_id_str);
+				}
 			}
 		}
 	}
@@ -121,7 +137,7 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>) -> Response {
 	let query = get_file_id(&bucket, &name).await;
 
 	if let Some(file_id) = query {
-		println!("[  \x1b[32mOK  \x1b[0m]BUCKET:{bucket} NAME:{name} -> {file_id}");
+		//println!("[  \x1b[32mOK  \x1b[0m]BUCKET:{bucket} NAME:{name} -> {file_id}");
 
 		let file_path = format!("/home/rumisan/Documents/RDS/{file_id}");
 		match File::open(&file_path).await {
