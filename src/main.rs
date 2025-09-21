@@ -1,3 +1,4 @@
+use chrono::Local;
 use sqlx::{mysql::MySqlPool};
 use axum::{
 	extract::Path,
@@ -56,8 +57,17 @@ fn get_sql_pool() -> &'static MySqlPool {
 
 //ファイル名→ID
 async fn get_file_id(bucket: &str, file_name: &str) -> Option<String> {
+	let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+	let systemd_ok = "[  \x1b[32mOK  \x1b[0m] ";
+	let space = "         ";
+
 	if let Some(file_id_str) = LRU_CACHE.lock().unwrap().get(&format!("{bucket}+{file_name}")) {
-		println!("[  \x1b[32mOK  \x1b[0m]BUCKET:{bucket} NAME:{file_name} -[CACHE]-> {file_id_str}");
+		println!("{systemd_ok}┬{timestamp}");
+		println!("{space}├BUCKET:{bucket}");
+		println!("{space}├NAME:{file_name}");
+		println!("{space}├SOURCE:CACHE");
+		println!("{space}└ID:{file_id_str}");
+
 		return Some(file_id_str.to_string());
 	} else {
 		let pool = get_sql_pool();
@@ -75,7 +85,11 @@ async fn get_file_id(bucket: &str, file_name: &str) -> Option<String> {
 					let mut cache = LRU_CACHE.lock().unwrap();
 					cache.put(format!("{bucket}+{file_name}"), file_id_str.clone());
 
-					println!("[  \x1b[32mOK  \x1b[0m]BUCKET:{bucket} NAME:{file_name} -[ SQL ]-> {file_id}");
+					println!("{systemd_ok}┬{timestamp}");
+					println!("{space}├BUCKET:{bucket}");
+					println!("{space}├NAME:{file_name}");
+					println!("{space}├SOURCE:SQL");
+					println!("{space}└ID:{file_id}");
 
 					return Some(file_id_str);
 				}
