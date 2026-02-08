@@ -153,7 +153,7 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>) -> Response {
 	if let Some(file_id) = query {
 		//println!("[  \x1b[32mOK  \x1b[0m]BUCKET:{bucket} NAME:{name} -> {file_id}");
 
-		let file_path = format!("/home/rumisan/Documents/RDS/{file_id}");
+		let file_path = format!("./RDS/{file_id}");
 		match File::open(&file_path).await {
 			Ok(file) => {
 				//メモリ破壊マン回避
