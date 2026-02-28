@@ -153,7 +153,7 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>) -> Response {
 	if let Some(file_id) = query {
 		//println!("[  \x1b[32mOK  \x1b[0m]BUCKET:{bucket} NAME:{name} -> {file_id}");
 
-		let file_path = format!("./RDS/{file_id}");
+		let file_path = format!("/mnt/DATA/RDS/{file_id}");
 		match File::open(&file_path).await {
 			Ok(file) => {
 				//メモリ破壊マン回避
@@ -169,7 +169,7 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>) -> Response {
 				//ファイルを開けなかった
 				let mut header_list = HeaderMap::new();
 				header_list.insert(header::CONTENT_TYPE, "text/plain; charset=UTF-8".parse().unwrap());
-				(StatusCode::NOT_FOUND, header_list, format!("ファイル本体が見つかりませんでした（泣）\nバケット名:{bucket}\nファイル名:{name}")).into_response()
+				(StatusCode::NOT_FOUND, header_list, format!("ファイル本体が見つかりませんでした（泣）\nバケット名:{bucket}\nファイル名:{name}\nパス:{file_path}")).into_response()
 			}
 		}
 	} else {
