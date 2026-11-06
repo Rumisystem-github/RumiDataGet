@@ -1,6 +1,8 @@
 use anyhow::Context;
 use chrono::Local;
-use sqlx::{mysql::MySqlPool};
+use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
+use std::net::SocketAddr;
+use tower_governor::{governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer};
 use axum::{
 	extract::Path,
 	body::{Body},
@@ -30,6 +32,7 @@ struct FilePath {
 static SQL_POOL: OnceCell<MySqlPool> = OnceCell::new();
 static DATA_DIR: OnceCell<String> = OnceCell::new();
 static FILE_CACHE: OnceCell<Option<Cache<(String, String), Option<String>>>> = OnceCell::new();
+static QUERY_TIMEOUT: OnceCell<Option<Duration>> = OnceCell::new();
 
 //ファイル読み取りのバッファサイズ（読み取り回数を減らす）
 const STREAM_BUFFER_SIZE: usize = 128 * 1024;
@@ -63,7 +66,31 @@ async fn main() -> anyhow::Result<()> {
 	};
 	let _ = FILE_CACHE.set(cache);
 
-	let pool = MySqlPool::connect(&database_url).await?;
+	//DBクエリのタイムアウト秒数（.envのDB_QUERY_TIMEOUT_SEC、無ければ5。0で無効）
+	let query_timeout_sec: u64 = std::env::var("DB_QUERY_TIMEOUT_SEC")
+		.ok()
+		.and_then(|v| v.parse().ok())
+		.unwrap_or(5);
+	let _ = QUERY_TIMEOUT.set(if query_timeout_sec > 0 {
+		Some(Duration::from_secs(query_timeout_sec))
+	} else {
+		None
+	});
+
+	//接続プール（最大接続数と取得タイムアウトは.envで調整可能）
+	let max_connections: u32 = std::env::var("DB_MAX_CONNECTIONS")
+		.ok()
+		.and_then(|v| v.parse().ok())
+		.unwrap_or(20);
+	let acquire_timeout_sec: u64 = std::env::var("DB_ACQUIRE_TIMEOUT_SEC")
+		.ok()
+		.and_then(|v| v.parse().ok())
+		.unwrap_or(10);
+	let pool = MySqlPoolOptions::new()
+		.max_connections(max_connections)
+		.acquire_timeout(Duration::from_secs(acquire_timeout_sec))
+		.connect(&database_url)
+		.await?;
 	SQL_POOL.set(pool).map_err(|_| {
 		eprintln!("エラー");
 
@@ -73,10 +100,58 @@ async fn main() -> anyhow::Result<()> {
 	let app = Router::new();
 	let app = app.route("/{bucket}/{*name}", get(root));
 
+	//IP毎のレート制限（.envのRATE_LIMIT_PER_SEC、無ければ10。0で無効）
+	let rate_per_sec: u64 = std::env::var("RATE_LIMIT_PER_SEC")
+		.ok()
+		.and_then(|v| v.parse().ok())
+		.unwrap_or(10);
+	let app = if rate_per_sec > 0 {
+		let rate_burst: u32 = std::env::var("RATE_LIMIT_BURST")
+			.ok()
+			.and_then(|v| v.parse().ok())
+			.unwrap_or(60)
+			.max(1);
+		//リバースプロキシ経由の場合はヘッダーのIPを見る（.envのRATE_LIMIT_TRUST_PROXY=1）
+		let trust_proxy = matches!(
+			std::env::var("RATE_LIMIT_TRUST_PROXY").as_deref(),
+			Ok("1") | Ok("true")
+		);
+
+		if trust_proxy {
+			let governor_conf = GovernorConfigBuilder::default()
+				.per_second(rate_per_sec)
+				.burst_size(rate_burst)
+				.key_extractor(SmartIpKeyExtractor)
+				.finish()
+				.unwrap();
+			let governor_limiter = governor_conf.limiter().clone();
+			//古いIPの記録を定期的に掃除する（メモリが増え続けないように）
+			std::thread::spawn(move || loop {
+				std::thread::sleep(Duration::from_secs(60));
+				governor_limiter.retain_recent();
+			});
+			app.layer(GovernorLayer::new(governor_conf))
+		} else {
+			let governor_conf = GovernorConfigBuilder::default()
+				.per_second(rate_per_sec)
+				.burst_size(rate_burst)
+				.finish()
+				.unwrap();
+			let governor_limiter = governor_conf.limiter().clone();
+			std::thread::spawn(move || loop {
+				std::thread::sleep(Duration::from_secs(60));
+				governor_limiter.retain_recent();
+			});
+			app.layer(GovernorLayer::new(governor_conf))
+		}
+	} else {
+		app
+	};
+
 	//待ち受けアドレス（.envのBIND_ADDR、無ければ従来の0.0.0.0:3007）
 	let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3007".to_string());
 	let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-	axum::serve(listener, app).await.unwrap();
+	axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
 
 	Ok(())
 }
@@ -99,6 +174,11 @@ fn get_sql_pool() -> &'static MySqlPool {
 //ファイルID解決のキャッシュを拾ってくる（無効な場合はNone）
 fn get_file_cache() -> Option<&'static Cache<(String, String), Option<String>>> {
 	FILE_CACHE.get().and_then(|cache| cache.as_ref())
+}
+
+//DBクエリのタイムアウトを拾ってくる（無効な場合はNone）
+fn get_query_timeout() -> Option<Duration> {
+	QUERY_TIMEOUT.get().copied().flatten()
 }
 
 //アクセスログを1回でまとめて書く（並行リクエストでログ行が混ざる対策も兼ねる）
@@ -126,14 +206,26 @@ async fn get_file_id(bucket: &str, file_name: &str) -> Option<String> {
 
 	let pool = get_sql_pool();
 	let script = "SELECT `FILE` FROM `DATA` WHERE `NAME` = ? AND `BUCKET` = ? AND `PUBLIC` = 1 LIMIT 1;";
-	let query_result:anyhow::Result<Vec<FileInfo>, sqlx::Error> = sqlx::query_as(script)
+	let query = sqlx::query_as(script)
 		.bind(file_name)
 		.bind(bucket)
-		.fetch_all(pool).await;
+		.fetch_all(pool);
+
+	//クエリにだけタイムアウトを掛ける（ファイル本体の配信は対象外）
+	let query_result: Result<Vec<FileInfo>, sqlx::Error> = match get_query_timeout() {
+		Some(limit) => match tokio::time::timeout(limit, query).await {
+			Ok(result) => result,
+			//タイムアウト時はキャッシュせずに「見つからない」として返す
+			Err(_) => return None,
+		},
+		None => query.await,
+	};
 
 	let mut result = None;
+	let mut completed = false;
 
 	if let Ok(query) = query_result {
+		completed = true;
 		if let Some(row) = query.first() {
 			if let Some(file_id) = row.file.as_ref() {
 				let file_id_str = file_id.to_string();
@@ -145,9 +237,11 @@ async fn get_file_id(bucket: &str, file_name: &str) -> Option<String> {
 		}
 	}
 
-	//DBを引いた結果はキャッシュに入れる（None＝見つからなかった、も入れる）
-	if let Some(cache) = get_file_cache() {
-		cache.insert((bucket.to_string(), file_name.to_string()), result.clone()).await;
+	//DBを正常に引けた結果だけキャッシュに入れる（エラー時の結果でキャッシュを汚さない）
+	if completed {
+		if let Some(cache) = get_file_cache() {
+			cache.insert((bucket.to_string(), file_name.to_string()), result.clone()).await;
+		}
 	}
 
 	result
