@@ -1,3 +1,4 @@
+use anyhow::Context;
 use chrono::Local;
 use sqlx::{mysql::MySqlPool};
 use axum::{
@@ -24,12 +25,21 @@ struct FilePath {
 }
 
 static SQL_POOL: OnceCell<MySqlPool> = OnceCell::new();
+static DATA_DIR: OnceCell<String> = OnceCell::new();
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-	let database_url = "mysql://data_server:aya442377@192.168.0.130:3306/DataServer";
+	//.envがあれば読み込む（既に環境変数で設定されてる値は上書きしない）
+	let _ = dotenvy::dotenv();
 
-	let pool = MySqlPool::connect(database_url).await?;
+	let database_url = std::env::var("DATABASE_URL")
+		.context("DATABASE_URLが設定されてない（.envか環境変数で設定して）")?;
+
+	//ファイル実体の置き場所（.envのDATA_DIR、無ければ従来のパス）
+	let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/mnt/DATA/RDS".to_string());
+	let _ = DATA_DIR.set(data_dir);
+
+	let pool = MySqlPool::connect(&database_url).await?;
 	SQL_POOL.set(pool).map_err(|_| {
 		eprintln!("エラー");
 
@@ -39,10 +49,17 @@ async fn main() -> anyhow::Result<()> {
 	let app = Router::new();
 	let app = app.route("/{bucket}/{*name}", get(root));
 
-	let listener = tokio::net::TcpListener::bind("0.0.0.0:3007").await.unwrap();
+	//待ち受けアドレス（.envのBIND_ADDR、無ければ従来の0.0.0.0:3007）
+	let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3007".to_string());
+	let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
 	axum::serve(listener, app).await.unwrap();
 
 	Ok(())
+}
+
+//ファイル実体の置き場所を拾ってくる
+fn get_data_dir() -> &'static str {
+	DATA_DIR.get().map(|s| s.as_str()).unwrap_or("/mnt/DATA/RDS")
 }
 
 //MySqlPoolを拾ってくる
@@ -135,7 +152,7 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>) -> Response {
 	if let Some(file_id) = query {
 		//println!("[  \x1b[32mOK  \x1b[0m]BUCKET:{bucket} NAME:{name} -> {file_id}");
 
-		let file_path = format!("/mnt/DATA/RDS/{file_id}");
+		let file_path = format!("{}/{file_id}", get_data_dir());
 		match File::open(&file_path).await {
 			Ok(file) => {
 				//メモリ破壊マン回避
