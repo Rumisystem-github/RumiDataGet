@@ -12,6 +12,8 @@ use axum::{
 use once_cell::sync::OnceCell;
 use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt}};
 use tokio_util::io::ReaderStream;
+use moka::future::Cache;
+use std::time::Duration;
 
 #[derive(sqlx::FromRow, Debug, PartialEq, Eq)]
 struct FileInfo {
@@ -27,6 +29,10 @@ struct FilePath {
 
 static SQL_POOL: OnceCell<MySqlPool> = OnceCell::new();
 static DATA_DIR: OnceCell<String> = OnceCell::new();
+static FILE_CACHE: OnceCell<Option<Cache<(String, String), Option<String>>>> = OnceCell::new();
+
+//ファイル読み取りのバッファサイズ（読み取り回数を減らす）
+const STREAM_BUFFER_SIZE: usize = 128 * 1024;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,6 +45,23 @@ async fn main() -> anyhow::Result<()> {
 	//ファイル実体の置き場所（.envのDATA_DIR、無ければ従来のパス）
 	let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/mnt/DATA/RDS".to_string());
 	let _ = DATA_DIR.set(data_dir);
+
+	//ファイルID解決のキャッシュ保持秒数（.envのCACHE_TTL_SEC、無ければ30。0で無効）
+	let cache_ttl: u64 = std::env::var("CACHE_TTL_SEC")
+		.ok()
+		.and_then(|v| v.parse().ok())
+		.unwrap_or(30);
+	let cache = if cache_ttl > 0 {
+		Some(
+			Cache::builder()
+				.max_capacity(10_000)
+				.time_to_live(Duration::from_secs(cache_ttl))
+				.build(),
+		)
+	} else {
+		None
+	};
+	let _ = FILE_CACHE.set(cache);
 
 	let pool = MySqlPool::connect(&database_url).await?;
 	SQL_POOL.set(pool).map_err(|_| {
@@ -73,49 +96,65 @@ fn get_sql_pool() -> &'static MySqlPool {
 	SQL_POOL.get().expect("SQL_POOLが初期化されてない")
 }
 
-//ファイル名→ID
-async fn get_file_id(bucket: &str, file_name: &str) -> Option<String> {
+//ファイルID解決のキャッシュを拾ってくる（無効な場合はNone）
+fn get_file_cache() -> Option<&'static Cache<(String, String), Option<String>>> {
+	FILE_CACHE.get().and_then(|cache| cache.as_ref())
+}
+
+//アクセスログを1回でまとめて書く（並行リクエストでログ行が混ざる対策も兼ねる）
+fn log_access(bucket: &str, file_name: &str, source: &str, file_id: &str) {
 	let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 	let systemd_ok = "[  \x1b[32mOK  \x1b[0m] ";
 	let space = "         ";
+	let bucket = log_safe(bucket);
+	let file_name = log_safe(file_name);
+
+	println!("{systemd_ok}┬{timestamp}\n{space}├BUCKET:{bucket}\n{space}├NAME:{file_name}\n{space}├SOURCE:{source}\n{space}└ID:{file_id}");
+}
+
+//ファイル名→ID
+async fn get_file_id(bucket: &str, file_name: &str) -> Option<String> {
+	//キャッシュにあればDBを引かずに返す（見つからなかった結果もキャッシュする）
+	if let Some(cache) = get_file_cache() {
+		if let Some(cached) = cache.get(&(bucket.to_string(), file_name.to_string())).await {
+			if let Some(file_id_str) = &cached {
+				log_access(bucket, file_name, "CACHE", file_id_str);
+			}
+			return cached;
+		}
+	}
 
 	let pool = get_sql_pool();
-	let script = "SELECT `FILE` FROM `DATA` WHERE `NAME` = ? AND `BUCKET` = ? AND `PUBLIC` = 1;";
+	let script = "SELECT `FILE` FROM `DATA` WHERE `NAME` = ? AND `BUCKET` = ? AND `PUBLIC` = 1 LIMIT 1;";
 	let query_result:anyhow::Result<Vec<FileInfo>, sqlx::Error> = sqlx::query_as(script)
 		.bind(file_name)
 		.bind(bucket)
 		.fetch_all(pool).await;
+
+	let mut result = None;
 
 	if let Ok(query) = query_result {
 		if let Some(row) = query.first() {
 			if let Some(file_id) = row.file.as_ref() {
 				let file_id_str = file_id.to_string();
 
-				//ログには制御文字を除いた物を出す（改行でのログ偽造対策）
-				let bucket = log_safe(bucket);
-				let file_name = log_safe(file_name);
+				log_access(bucket, file_name, "SQL", &file_id_str);
 
-				println!("{systemd_ok}┬{timestamp}");
-				println!("{space}├BUCKET:{bucket}");
-				println!("{space}├NAME:{file_name}");
-				println!("{space}├SOURCE:SQL");
-				println!("{space}└ID:{file_id}");
-
-				return Some(file_id_str);
+				result = Some(file_id_str);
 			}
 		}
 	}
 
-	None
+	//DBを引いた結果はキャッシュに入れる（None＝見つからなかった、も入れる）
+	if let Some(cache) = get_file_cache() {
+		cache.insert((bucket.to_string(), file_name.to_string()), result.clone()).await;
+	}
+
+	result
 }
 
-//マジックナンバーからMIMEタイプを引っ張ってくるのです
-async fn get_mimetype(file_path: &str) -> &'static str {
-	let mut file = match File::open(file_path).await {
-		Ok(f) => f,
-		Err(_) => return "application/octet-stream"
-	};
-
+//マジックナンバーからMIMEタイプを引っ張ってくるのです（開いてあるファイルの先頭を読む）
+async fn get_mimetype(file: &mut File) -> &'static str {
 	let mut buffer = [0u8; 12];
 	let bytes_read = match file.read(&mut buffer).await {
 		Ok(n) => n,
@@ -164,9 +203,9 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>, headers: HeaderMap) 
 
 		let file_path = format!("{}/{file_id}", get_data_dir());
 		match File::open(&file_path).await {
-			Ok(file) => {
-				let mime = get_mimetype(&file_path).await;
+			Ok(mut file) => {
 				let file_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+				let mime = get_mimetype(&mut file).await;
 				let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
 
 				match parse_range(range_header, file_size) {
@@ -200,8 +239,10 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>, headers: HeaderMap) 
 						(StatusCode::RANGE_NOT_SATISFIABLE, header_list, format!("指定された範囲がファイルサイズを超えています\nバケット名:{bucket}\nファイル名:{name}")).into_response()
 					},
 					RangeResult::Full => {
-						//メモリ破壊マン回避
-						let stream = ReaderStream::new(file);
+						//マジックナンバー読みで進んだ読み取り位置を先頭に戻す
+						let _ = file.seek(std::io::SeekFrom::Start(0)).await;
+						//メモリ破壊マン回避（バッファを大きくして読み取り回数を減らす）
+						let stream = ReaderStream::with_capacity(file, STREAM_BUFFER_SIZE);
 						let body = Body::from_stream(stream);
 						let mut header_list = HeaderMap::new();
 						header_list.insert(header::CONTENT_TYPE, mime.parse().unwrap());
@@ -296,7 +337,7 @@ fn parse_range(range_header: Option<&str>, file_size: u64) -> RangeResult {
 //ファイルの途中から指定バイト数だけを返すBodyを作る
 async fn partial_body(mut file: File, start: u64, len: u64) -> std::io::Result<Body> {
 	file.seek(std::io::SeekFrom::Start(start)).await?;
-	Ok(Body::from_stream(ReaderStream::new(file.take(len))))
+	Ok(Body::from_stream(ReaderStream::with_capacity(file.take(len), STREAM_BUFFER_SIZE)))
 }
 
 #[cfg(test)]
@@ -357,6 +398,16 @@ mod tests {
 		let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
 
 		assert_eq!(&bytes[..], b"234");
+		let _ = std::fs::remove_file(&path);
+	}
+
+	#[tokio::test]
+	async fn mimetype_reads_open_file() {
+		let path = std::env::temp_dir().join(format!("rumi_mime_test_{}.bin", std::process::id()));
+		std::fs::write(&path, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]).unwrap();
+
+		let mut file = File::open(&path).await.unwrap();
+		assert_eq!(get_mimetype(&mut file).await, "image/png");
 		let _ = std::fs::remove_file(&path);
 	}
 }
