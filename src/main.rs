@@ -10,7 +10,7 @@ use axum::{
 	Router
 };
 use once_cell::sync::OnceCell;
-use tokio::{fs::File, io::AsyncReadExt};
+use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt}};
 use tokio_util::io::ReaderStream;
 
 #[derive(sqlx::FromRow, Debug, PartialEq, Eq)]
@@ -146,7 +146,7 @@ async fn get_mimetype(file_path: &str) -> &'static str {
 }
 
 //HTTPリクエストでアクセスするばしょ
-async fn root(Path(FilePath{bucket, name}): Path<FilePath>) -> Response {
+async fn root(Path(FilePath{bucket, name}): Path<FilePath>, headers: HeaderMap) -> Response {
 	let query = get_file_id(&bucket, &name).await;
 
 	if let Some(file_id) = query {
@@ -155,14 +155,49 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>) -> Response {
 		let file_path = format!("{}/{file_id}", get_data_dir());
 		match File::open(&file_path).await {
 			Ok(file) => {
-				//メモリ破壊マン回避
-				let stream = ReaderStream::new(file);
-				let body = Body::from_stream(stream);
-				let header_list = [
-					(header::CONTENT_TYPE, get_mimetype(&file_path).await)
-				];
+				let mime = get_mimetype(&file_path).await;
+				let file_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+				let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
 
-				(StatusCode::OK, header_list, body).into_response()
+				match parse_range(range_header, file_size) {
+					RangeResult::Partial(start, end) => {
+						//範囲指定あり（206 Partial Content）
+						let len = end - start + 1;
+						match partial_body(file, start, len).await {
+							Ok(body) => {
+								let mut header_list = HeaderMap::new();
+								header_list.insert(header::CONTENT_TYPE, mime.parse().unwrap());
+								header_list.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+								header_list.insert(header::CONTENT_RANGE, format!("bytes {start}-{end}/{file_size}").parse().unwrap());
+								header_list.insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
+								(StatusCode::PARTIAL_CONTENT, header_list, body).into_response()
+							},
+							Err(_) => {
+								let mut header_list = HeaderMap::new();
+								header_list.insert(header::CONTENT_TYPE, "text/plain; charset=UTF-8".parse().unwrap());
+								(StatusCode::INTERNAL_SERVER_ERROR, header_list, "ファイルの読み込みに失敗しました\n").into_response()
+							}
+						}
+					},
+					RangeResult::NotSatisfiable => {
+						//範囲がファイルの範囲外（416 Range Not Satisfiable）
+						let mut header_list = HeaderMap::new();
+						header_list.insert(header::CONTENT_TYPE, "text/plain; charset=UTF-8".parse().unwrap());
+						header_list.insert(header::CONTENT_RANGE, format!("bytes */{file_size}").parse().unwrap());
+						(StatusCode::RANGE_NOT_SATISFIABLE, header_list, format!("指定された範囲がファイルサイズを超えています\nバケット名:{bucket}\nファイル名:{name}")).into_response()
+					},
+					RangeResult::Full => {
+						//メモリ破壊マン回避
+						let stream = ReaderStream::new(file);
+						let body = Body::from_stream(stream);
+						let mut header_list = HeaderMap::new();
+						header_list.insert(header::CONTENT_TYPE, mime.parse().unwrap());
+						header_list.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+						header_list.insert(header::CONTENT_LENGTH, file_size.to_string().parse().unwrap());
+
+						(StatusCode::OK, header_list, body).into_response()
+					}
+				}
 			},
 			Err(_) => {
 				//ファイルを開けなかった
@@ -176,5 +211,136 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>) -> Response {
 		let mut header_list = HeaderMap::new();
 		header_list.insert(header::CONTENT_TYPE, "text/plain; charset=UTF-8".parse().unwrap());
 		(StatusCode::NOT_FOUND, header_list, format!("ファイルが見つかりませんでした（泣）\nバケット名:{bucket}\nファイル名:{name}")).into_response()
+	}
+}
+
+//Rangeヘッダーの解釈結果
+#[derive(Debug, PartialEq, Eq)]
+enum RangeResult {
+	//範囲指定なし（ファイル全体を返す）
+	Full,
+	//範囲あり（開始位置, 終了位置）※終了位置を含む
+	Partial(u64, u64),
+	//範囲がファイルの範囲外で返せない（416）
+	NotSatisfiable
+}
+
+//Rangeヘッダーを解釈する
+//対応するのは単一範囲のみ。複数範囲や不正な書式の場合はヘッダー自体を無視して全体を返す（RFC 9110で許可された挙動）
+fn parse_range(range_header: Option<&str>, file_size: u64) -> RangeResult {
+	let Some(range_header) = range_header else {
+		return RangeResult::Full;
+	};
+	let Some(spec) = range_header.strip_prefix("bytes=") else {
+		return RangeResult::Full;
+	};
+
+	//複数範囲（bytes=0-99,200-299）は未対応なので無視
+	if spec.contains(',') {
+		return RangeResult::Full;
+	}
+
+	let Some((start_str, end_str)) = spec.split_once('-') else {
+		return RangeResult::Full;
+	};
+
+	if start_str.is_empty() {
+		//末尾Nバイト指定（bytes=-N）
+		let Ok(suffix_len) = end_str.parse::<u64>() else {
+			return RangeResult::Full;
+		};
+		if suffix_len == 0 || file_size == 0 {
+			return RangeResult::NotSatisfiable;
+		}
+		let len = suffix_len.min(file_size);
+		RangeResult::Partial(file_size - len, file_size - 1)
+	} else {
+		let Ok(start) = start_str.parse::<u64>() else {
+			return RangeResult::Full;
+		};
+		if start >= file_size {
+			return RangeResult::NotSatisfiable;
+		}
+		if end_str.is_empty() {
+			//開始位置から最後まで（bytes=N-）
+			RangeResult::Partial(start, file_size - 1)
+		} else {
+			let Ok(end) = end_str.parse::<u64>() else {
+				return RangeResult::Full;
+			};
+			if end < start {
+				//不正な範囲は無視
+				return RangeResult::Full;
+			}
+			RangeResult::Partial(start, end.min(file_size - 1))
+		}
+	}
+}
+
+//ファイルの途中から指定バイト数だけを返すBodyを作る
+async fn partial_body(mut file: File, start: u64, len: u64) -> std::io::Result<Body> {
+	file.seek(std::io::SeekFrom::Start(start)).await?;
+	Ok(Body::from_stream(ReaderStream::new(file.take(len))))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn range_none_is_full() {
+		assert_eq!(parse_range(None, 1000), RangeResult::Full);
+	}
+
+	#[test]
+	fn range_normal() {
+		assert_eq!(parse_range(Some("bytes=0-99"), 1000), RangeResult::Partial(0, 99));
+		assert_eq!(parse_range(Some("bytes=100-199"), 1000), RangeResult::Partial(100, 199));
+	}
+
+	#[test]
+	fn range_open_end() {
+		assert_eq!(parse_range(Some("bytes=500-"), 1000), RangeResult::Partial(500, 999));
+	}
+
+	#[test]
+	fn range_suffix() {
+		assert_eq!(parse_range(Some("bytes=-100"), 1000), RangeResult::Partial(900, 999));
+		//ファイルサイズより大きい末尾指定は全体になる
+		assert_eq!(parse_range(Some("bytes=-2000"), 1000), RangeResult::Partial(0, 999));
+	}
+
+	#[test]
+	fn range_end_clamped() {
+		assert_eq!(parse_range(Some("bytes=0-9999"), 1000), RangeResult::Partial(0, 999));
+	}
+
+	#[test]
+	fn range_not_satisfiable() {
+		assert_eq!(parse_range(Some("bytes=1000-"), 1000), RangeResult::NotSatisfiable);
+		assert_eq!(parse_range(Some("bytes=-0"), 1000), RangeResult::NotSatisfiable);
+		assert_eq!(parse_range(Some("bytes=0-"), 0), RangeResult::NotSatisfiable);
+	}
+
+	#[test]
+	fn range_invalid_is_ignored() {
+		assert_eq!(parse_range(Some("bytes=abc-def"), 1000), RangeResult::Full);
+		assert_eq!(parse_range(Some("bytes=200-100"), 1000), RangeResult::Full);
+		assert_eq!(parse_range(Some("items=0-100"), 1000), RangeResult::Full);
+		//複数範囲は無視して全体
+		assert_eq!(parse_range(Some("bytes=0-99,200-299"), 1000), RangeResult::Full);
+	}
+
+	#[tokio::test]
+	async fn partial_body_reads_middle() {
+		let path = std::env::temp_dir().join(format!("rumi_range_test_{}.bin", std::process::id()));
+		std::fs::write(&path, b"0123456789").unwrap();
+
+		let file = File::open(&path).await.unwrap();
+		let body = partial_body(file, 2, 3).await.unwrap();
+		let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+
+		assert_eq!(&bytes[..], b"234");
+		let _ = std::fs::remove_file(&path);
 	}
 }
