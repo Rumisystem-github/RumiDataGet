@@ -1,8 +1,6 @@
 use anyhow::Context;
 use chrono::Local;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
-use std::net::SocketAddr;
-use tower_governor::{governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer};
 use axum::{
 	extract::Path,
 	body::{Body},
@@ -100,58 +98,10 @@ async fn main() -> anyhow::Result<()> {
 	let app = Router::new();
 	let app = app.route("/{bucket}/{*name}", get(root));
 
-	//IP毎のレート制限（.envのRATE_LIMIT_PER_SEC、無ければ10。0で無効）
-	let rate_per_sec: u64 = std::env::var("RATE_LIMIT_PER_SEC")
-		.ok()
-		.and_then(|v| v.parse().ok())
-		.unwrap_or(10);
-	let app = if rate_per_sec > 0 {
-		let rate_burst: u32 = std::env::var("RATE_LIMIT_BURST")
-			.ok()
-			.and_then(|v| v.parse().ok())
-			.unwrap_or(60)
-			.max(1);
-		//リバースプロキシ経由の場合はヘッダーのIPを見る（.envのRATE_LIMIT_TRUST_PROXY=1）
-		let trust_proxy = matches!(
-			std::env::var("RATE_LIMIT_TRUST_PROXY").as_deref(),
-			Ok("1") | Ok("true")
-		);
-
-		if trust_proxy {
-			let governor_conf = GovernorConfigBuilder::default()
-				.per_second(rate_per_sec)
-				.burst_size(rate_burst)
-				.key_extractor(SmartIpKeyExtractor)
-				.finish()
-				.unwrap();
-			let governor_limiter = governor_conf.limiter().clone();
-			//古いIPの記録を定期的に掃除する（メモリが増え続けないように）
-			std::thread::spawn(move || loop {
-				std::thread::sleep(Duration::from_secs(60));
-				governor_limiter.retain_recent();
-			});
-			app.layer(GovernorLayer::new(governor_conf))
-		} else {
-			let governor_conf = GovernorConfigBuilder::default()
-				.per_second(rate_per_sec)
-				.burst_size(rate_burst)
-				.finish()
-				.unwrap();
-			let governor_limiter = governor_conf.limiter().clone();
-			std::thread::spawn(move || loop {
-				std::thread::sleep(Duration::from_secs(60));
-				governor_limiter.retain_recent();
-			});
-			app.layer(GovernorLayer::new(governor_conf))
-		}
-	} else {
-		app
-	};
-
 	//待ち受けアドレス（.envのBIND_ADDR、無ければ従来の0.0.0.0:3007）
 	let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3007".to_string());
 	let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-	axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+	axum::serve(listener, app).await.unwrap();
 
 	Ok(())
 }
