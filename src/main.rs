@@ -27,7 +27,7 @@ struct FilePath {
 static SQL_POOL: OnceCell<MySqlPool> = OnceCell::new();
 static DATA_DIR: OnceCell<String> = OnceCell::new();
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	//.envがあれば読み込む（既に環境変数で設定されてる値は上書きしない）
 	let _ = dotenvy::dotenv();
@@ -62,6 +62,11 @@ fn get_data_dir() -> &'static str {
 	DATA_DIR.get().map(|s| s.as_str()).unwrap_or("/mnt/DATA/RDS")
 }
 
+//ログ出力用に制御文字を取り除く
+fn log_safe(text: &str) -> String {
+	text.chars().filter(|c| !c.is_control()).collect()
+}
+
 //MySqlPoolを拾ってくる
 fn get_sql_pool() -> &'static MySqlPool {
 	SQL_POOL.get().expect("SQL_POOLが初期化されてない")
@@ -84,6 +89,10 @@ async fn get_file_id(bucket: &str, file_name: &str) -> Option<String> {
 		if let Some(row) = query.first() {
 			if let Some(file_id) = row.FILE.as_ref() {
 				let file_id_str = file_id.to_string();
+
+				//ログには制御文字を除いた物を出す（改行でのログ偽造対策）
+				let bucket = log_safe(bucket);
+				let file_name = log_safe(file_name);
 
 				println!("{systemd_ok}┬{timestamp}");
 				println!("{space}├BUCKET:{bucket}");
@@ -167,6 +176,7 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>, headers: HeaderMap) 
 							Ok(body) => {
 								let mut header_list = HeaderMap::new();
 								header_list.insert(header::CONTENT_TYPE, mime.parse().unwrap());
+								header_list.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
 								header_list.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
 								header_list.insert(header::CONTENT_RANGE, format!("bytes {start}-{end}/{file_size}").parse().unwrap());
 								header_list.insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
@@ -175,6 +185,7 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>, headers: HeaderMap) 
 							Err(_) => {
 								let mut header_list = HeaderMap::new();
 								header_list.insert(header::CONTENT_TYPE, "text/plain; charset=UTF-8".parse().unwrap());
+								header_list.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
 								(StatusCode::INTERNAL_SERVER_ERROR, header_list, "ファイルの読み込みに失敗しました\n").into_response()
 							}
 						}
@@ -183,6 +194,7 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>, headers: HeaderMap) 
 						//範囲がファイルの範囲外（416 Range Not Satisfiable）
 						let mut header_list = HeaderMap::new();
 						header_list.insert(header::CONTENT_TYPE, "text/plain; charset=UTF-8".parse().unwrap());
+						header_list.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
 						header_list.insert(header::CONTENT_RANGE, format!("bytes */{file_size}").parse().unwrap());
 						(StatusCode::RANGE_NOT_SATISFIABLE, header_list, format!("指定された範囲がファイルサイズを超えています\nバケット名:{bucket}\nファイル名:{name}")).into_response()
 					},
@@ -192,6 +204,7 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>, headers: HeaderMap) 
 						let body = Body::from_stream(stream);
 						let mut header_list = HeaderMap::new();
 						header_list.insert(header::CONTENT_TYPE, mime.parse().unwrap());
+						header_list.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
 						header_list.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
 						header_list.insert(header::CONTENT_LENGTH, file_size.to_string().parse().unwrap());
 
@@ -203,13 +216,15 @@ async fn root(Path(FilePath{bucket, name}): Path<FilePath>, headers: HeaderMap) 
 				//ファイルを開けなかった
 				let mut header_list = HeaderMap::new();
 				header_list.insert(header::CONTENT_TYPE, "text/plain; charset=UTF-8".parse().unwrap());
-				(StatusCode::NOT_FOUND, header_list, format!("ファイル本体が見つかりませんでした（泣）\nバケット名:{bucket}\nファイル名:{name}\nパス:{file_path}")).into_response()
+				header_list.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+				(StatusCode::NOT_FOUND, header_list, format!("ファイル本体が見つかりませんでした（泣）\nバケット名:{bucket}\nファイル名:{name}")).into_response()
 			}
 		}
 	} else {
 		//そんなファイルねーよばーーーーーーーーーか
 		let mut header_list = HeaderMap::new();
 		header_list.insert(header::CONTENT_TYPE, "text/plain; charset=UTF-8".parse().unwrap());
+		header_list.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
 		(StatusCode::NOT_FOUND, header_list, format!("ファイルが見つかりませんでした（泣）\nバケット名:{bucket}\nファイル名:{name}")).into_response()
 	}
 }
