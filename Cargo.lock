@@ -1293,6 +1293,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "dotenvy",
  "lru",
  "once_cell",
  "serde",
