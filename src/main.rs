@@ -189,6 +189,18 @@ async fn get_mimetype(file: &mut File) -> &'static str {
 		} else {
 			"video/x-matroska"
 		}
+	} else if slice.len() >= 12 && &slice[0..4] == b"RIFF" && &slice[8..12] == b"WAVE" {
+		//WAV（RIFFコンテナの中身がWAVE）
+		"audio/wav"
+	} else if slice.len() >= 4 && &slice[0..4] == b"fLaC" {
+		//FLAC
+		"audio/flac"
+	} else if slice.len() >= 3 && &slice[0..3] == b"ID3" {
+		//MP3（ID3v2タグ付き）
+		"audio/mpeg"
+	} else if slice.len() >= 2 && slice[0] == 0xFF && (slice[1] & 0xE0) == 0xE0 && (slice[1] & 0x06) != 0x00 {
+		//MP3（ID3なし。フレーム同期ビット＋レイヤー値が予約値でないこと）
+		"audio/mpeg"
 	} else {
 		"application/octet-stream"
 	}
@@ -409,5 +421,28 @@ mod tests {
 		let mut file = File::open(&path).await.unwrap();
 		assert_eq!(get_mimetype(&mut file).await, "image/png");
 		let _ = std::fs::remove_file(&path);
+	}
+
+	#[tokio::test]
+	async fn mimetype_detects_audio() {
+		let cases: [(&[u8], &str); 4] = [
+			//MP3（ID3v2タグ）
+			(b"ID3\x03\x00\x00", "audio/mpeg"),
+			//MP3（フレーム同期のみ）
+			(&[0xFF, 0xFB, 0x90, 0x00], "audio/mpeg"),
+			//WAV
+			(b"RIFF\x24\x00\x00\x00WAVE", "audio/wav"),
+			//FLAC
+			(b"fLaC\x00\x00\x00\x00", "audio/flac"),
+		];
+
+		for (i, (head, expected)) in cases.iter().enumerate() {
+			let path = std::env::temp_dir().join(format!("rumi_mime_audio_test_{}_{}.bin", std::process::id(), i));
+			std::fs::write(&path, head).unwrap();
+
+			let mut file = File::open(&path).await.unwrap();
+			assert_eq!(get_mimetype(&mut file).await, *expected);
+			let _ = std::fs::remove_file(&path);
+		}
 	}
 }
