@@ -15,7 +15,8 @@ use tokio_util::io::ReaderStream;
 
 #[derive(sqlx::FromRow, Debug, PartialEq, Eq)]
 struct FileInfo {
-	FILE: Option<i64>
+	#[sqlx(rename = "FILE")]
+	file: Option<i64>
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -87,7 +88,7 @@ async fn get_file_id(bucket: &str, file_name: &str) -> Option<String> {
 
 	if let Ok(query) = query_result {
 		if let Some(row) = query.first() {
-			if let Some(file_id) = row.FILE.as_ref() {
+			if let Some(file_id) = row.file.as_ref() {
 				let file_id_str = file_id.to_string();
 
 				//ログには制御文字を除いた物を出す（改行でのログ偽造対策）
